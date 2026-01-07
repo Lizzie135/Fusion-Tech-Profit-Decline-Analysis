@@ -1,6 +1,6 @@
 ---
 title: "FusionTech Customer Churn and Marketing ROI Analysis"
-author: "Elizabeth-Lynda, Sandi, Silas"
+author: "Elizabeth-Lynda"
 date: "2025-12-02"
 output:
   word_document:
@@ -631,5 +631,6 @@ Incorporating customer demographics
 Using survival models for time-to-churn estimation
 
 Developing prescriptive optimization for marketing allocation
+
 
 Overall, this analysis supports data-driven decision-making around customer retention and marketing efficiency for FusionTech.
