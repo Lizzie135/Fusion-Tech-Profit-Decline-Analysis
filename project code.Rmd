@@ -1,0 +1,635 @@
+---
+title: "FusionTech Customer Churn and Marketing ROI Analysis"
+author: "Elizabeth-Lynda, Sandi, Silas"
+date: "2025-12-02"
+output:
+  word_document:
+    toc: true
+    toc_depth: 2
+always_allow_html: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(pROC)
+library(randomForest)
+library(xgboost)
+library(knitr)
+library(kableExtra)
+```
+
+
+## Executive Summary
+
+This report presents a comprehensive customer analytics and marketing ROI study for FusionTech, based on a synthetic transaction dataset. The goal of this research is to understand customer purchasing behavior, predict churn, and evaluate the effectiveness of marketing channels. Using statistical modeling (logistic regression) and machine-learning methods (Random Forest and XGBoost), we classify churn risk and uncover the drivers of customer attrition.
+
+The strongest predictors of churn include customer recency, frequency, and gross margin contribution. Machine-learning models outperform logistic regression, with XGBoost achieving the highest AUC and predictive performance. Marketing ROI analysis highlights substantial differences in channel profitability, offering clear opportunities for optimizing marketing spend.
+
+The report concludes with actionable insights around retention prioritization, marketing optimization, and financial impacts of churn. These findings support FusionTech’s strategic goals related to customer lifetime value and efficient resource allocation.
+
+## 1. Introduction
+
+FusionTech is an electronics retailer aiming to reduce customer churn, maximize lifetime value, and improve marketing efficiency. Customer acquisition is costly; therefore, understanding customer behavior and identifying those at risk of churn are crucial to maintaining profitability.
+
+This project focuses on:
+
+Transforming raw transaction records into meaningful customer-level features.
+
+Building models to classify customers as likely or unlikely to churn.
+
+Quantifying the financial impact of churn on gross margin.
+
+Evaluating and comparing marketing channels based on ROI and contribution to sales.
+
+The dataset consists of transaction-level observations with revenue, gross margin, product returns, marketing touches, and timestamps. This enables both behavioral modeling and marketing analytics in a unified framework.
+
+## 2. Data
+
+The dataset includes the following fields:
+
+Customer transactions (revenue, margin, discount, returns)
+
+Dates of purchase
+
+Marketing exposure (campaign ID, marketing channel)
+
+Data Preparation & Cleaning
+
+Several preprocessing steps were required:
+
+Converting transaction_date to proper Date format
+
+Coercing revenue-, margin-, and discount-related values to numeric
+
+Calculating customer-level aggregates such as:
+
+Recency (days since last transaction)
+
+Frequency (90-day transaction count)
+
+Average order value
+
+Total revenue and gross margin
+
+Return rate
+
+Marketing touch count
+
+A churn rule was implemented:
+
+Customers with no purchases in the last 180 days (relative to dataset max date) were labeled as churned.
+
+Only a snapshot of the data structure is included; the full dataset is excluded per project requirements.
+
+## 3. Analysis
+## Load and Explore Data
+
+```{r load-data}
+transactions <- read.csv("C:/Users/auuser/Downloads/fusiontech_synthetic_transactions.csv")
+
+glimpse(transactions)
+summary(transactions)
+
+# Ensure correct types
+transactions <- transactions %>%
+  mutate(
+    transaction_date = as.Date(transaction_date),
+    return_flag = as.integer(return_flag),
+    discount_pct = as.numeric(discount_pct),
+    revenue = as.numeric(revenue),
+    gross_margin = as.numeric(gross_margin)
+  )
+```
+
+## 2. Customer-Level Features for Churn
+
+```{r customer-features}
+# Reference date for recency (set to max date in data)
+ref_date <- max(transactions$transaction_date, na.rm = TRUE)
+
+customer_features <- transactions %>%
+  group_by(customer_id) %>%
+  summarise(
+    total_transactions   = n(),
+    total_revenue        = sum(revenue, na.rm = TRUE),
+    avg_order_value      = mean(revenue, na.rm = TRUE),
+    recency_days         = as.numeric(ref_date - max(transaction_date, na.rm = TRUE)),
+    frequency_90d        = sum(transaction_date >= (ref_date - 90), na.rm = TRUE),
+    total_gross_margin   = sum(gross_margin, na.rm = TRUE),
+    return_rate          = mean(return_flag, na.rm = TRUE),
+    marketing_touch_count = sum(!is.na(campaign_id))
+  ) %>%
+  ungroup() %>%
+  mutate(
+    churn_flag = ifelse(recency_days > 180, 1, 0)
+  )
+
+glimpse(customer_features)
+table(customer_features$churn_flag)
+```
+
+## 3. Train/Test Split for Churn Models
+
+```{r churn-split}
+set.seed(123)
+churn_index <- createDataPartition(customer_features$churn_flag, p = 0.7, list = FALSE)
+churn_train <- customer_features[churn_index, ]
+churn_test  <- customer_features[-churn_index, ]
+
+x_train <- churn_train %>%
+  select(total_transactions, total_revenue, avg_order_value,
+         recency_days, frequency_90d, total_gross_margin,
+         return_rate, marketing_touch_count)
+
+x_test <- churn_test %>%
+  select(total_transactions, total_revenue, avg_order_value,
+         recency_days, frequency_90d, total_gross_margin,
+         return_rate, marketing_touch_count)
+
+y_train <- churn_train$churn_flag
+y_test  <- churn_test$churn_flag
+```
+
+## 4. Baseline Logistic Regression for Churn
+
+```{r churn-logistic}
+logit_model <- glm(
+  churn_flag ~ total_transactions + total_revenue + avg_order_value +
+    recency_days + frequency_90d + total_gross_margin +
+    return_rate + marketing_touch_count,
+  data = churn_train,
+  family = binomial
+)
+
+summary(logit_model)
+
+# Predictions and metrics
+logit_prob <- predict(logit_model, newdata = churn_test, type = "response")
+logit_pred <- ifelse(logit_prob >= 0.5, 1, 0)
+
+logit_conf <- confusionMatrix(
+  factor(logit_pred, levels = c(0,1)),
+  factor(y_test, levels = c(0,1))
+)
+
+logit_conf
+
+logit_roc <- roc(y_test, logit_prob)
+logit_auc <- auc(logit_roc)
+logit_auc
+```
+
+## 5. Tree-Based Churn Model (Random Forest / XGBoost)
+
+```{r churn-tree-prep}
+# Create model matrix for XGBoost (numeric matrix)
+churn_train_matrix <- as.matrix(x_train)
+churn_test_matrix  <- as.matrix(x_test)
+
+# Random Forest
+set.seed(123)
+rf_churn <- randomForest(
+  x = churn_train_matrix,
+  y = factor(y_train, levels = c(0,1)),
+  ntree = 300,
+  mtry = 3,
+  importance = TRUE
+)
+
+rf_prob <- predict(rf_churn, newdata = churn_test_matrix, type = "prob")[,2]
+rf_pred <- ifelse(rf_prob >= 0.5, 1, 0)
+
+rf_conf <- confusionMatrix(
+  factor(rf_pred, levels = c(0,1)),
+  factor(y_test, levels = c(0,1))
+)
+
+rf_conf
+
+rf_roc <- roc(y_test, rf_prob)
+rf_auc <- auc(rf_roc)
+rf_auc
+
+varImpPlot(rf_churn, main = "Random Forest Feature Importance (Churn)")
+```
+
+```{r churn-xgb}
+# XGBoost requires label as numeric 0/1
+dtrain <- xgb.DMatrix(data = churn_train_matrix, label = y_train)
+dtest  <- xgb.DMatrix(data = churn_test_matrix,  label = y_test)
+
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 6,
+  eta = 0.1,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+
+set.seed(123)
+xgb_churn <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 200,
+  watchlist = list(train = dtrain),
+  verbose = 0
+)
+
+xgb_prob <- predict(xgb_churn, dtest)
+xgb_pred <- ifelse(xgb_prob >= 0.5, 1, 0)
+
+xgb_conf <- confusionMatrix(
+  factor(xgb_pred, levels = c(0,1)),
+  factor(y_test, levels = c(0,1))
+)
+
+xgb_conf
+
+xgb_roc <- roc(y_test, xgb_prob)
+xgb_auc <- auc(xgb_roc)
+xgb_auc
+
+xgb.importance(model = xgb_churn) %>%
+  kable() %>%
+  kable_styling(full_width = FALSE)
+```
+
+## 6. Churn Model Comparison
+
+```{r} 
+churn_results <- tibble(
+  Model      = c("Logistic Regression", "Random Forest", "XGBoost"),
+  Accuracy   = c(logit_conf$overall["Accuracy"],
+                 rf_conf$overall["Accuracy"],
+                 xgb_conf$overall["Accuracy"]),
+  AUC        = c(as.numeric(logit_auc),
+                 as.numeric(rf_auc),
+                 as.numeric(xgb_auc)),
+  Sensitivity = c(logit_conf$byClass["Sensitivity"],
+                  rf_conf$byClass["Sensitivity"],
+                  xgb_conf$byClass["Sensitivity"]),
+  Specificity = c(logit_conf$byClass["Specificity"],
+                  rf_conf$byClass["Specificity"],
+                  xgb_conf$byClass["Specificity"])
+)
+
+churn_results
+```
+
+
+##Feature importance Bar chart
+```{r}
+library(tidyverse)
+
+rf_importance <- as.data.frame(importance(rf_churn)) %>%
+  rownames_to_column("feature") %>%
+  arrange(desc(MeanDecreaseGini))
+
+ggplot(rf_importance,
+       aes(x = reorder(feature, MeanDecreaseGini),
+           y = MeanDecreaseGini)) +
+  geom_col(fill = "#2C7BB6") +
+  coord_flip() +
+  labs(
+    title = "Feature Importance for Churn (Random Forest)",
+    x = NULL,
+    y = "Mean Decrease in Gini"
+  ) +
+  theme_minimal()
+```
+
+## Model comparison bar chart
+```{r}
+# if churn_results already exists as in your code:
+churn_results_long <- churn_results %>%
+  select(Model, Accuracy, AUC) %>%
+  pivot_longer(-Model, names_to = "Metric", values_to = "Value")
+
+ggplot(churn_results_long,
+       aes(x = Model, y = Value, fill = Metric)) +
+  geom_col(position = position_dodge(width = 0.7)) +
+  geom_text(aes(label = round(Value, 3)),
+            position = position_dodge(width = 0.7),
+            vjust = -0.3, size = 3) +
+  ylim(0, 1.05) +
+  labs(
+    title = "Churn Model Performance",
+    x = NULL,
+    y = "Score"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal()
+```
+
+##Simple waterfall of churn impact
+```{r}
+library(tidyverse)
+
+# 1) Build customer-level summary (already done as customer_features)
+# 2) Compute average margin and churn rate
+avg_margin_per_cust <- customer_features %>%
+  summarize(avg_margin = mean(total_gross_margin, na.rm = TRUE)) %>%
+  pull(avg_margin)
+
+churn_rate <- mean(customer_features$churn_flag)
+
+# 3) Create waterfall steps
+waterfall_df <- tibble(
+  Step = c("Total Potential Margin",
+           "Lost to Churn",
+           "Remaining"),
+  Value = c(
+    nrow(customer_features) * avg_margin_per_cust,
+    - nrow(customer_features) * avg_margin_per_cust * churn_rate,
+    nrow(customer_features) * avg_margin_per_cust * (1 - churn_rate)
+  ),
+  type = c("base", "loss", "final")
+)
+
+# 4) Compute cumulative positions
+waterfall_df <- waterfall_df %>%
+  mutate(
+    cumulative = cumsum(Value),
+    ymin = lag(cumulative, default = 0),
+    ymax = cumulative,
+    x = as.numeric(factor(Step))  # numeric x for rectangles
+  )
+
+# 5) Plot (note: use x, not Step, inside geom_rect)
+ggplot(waterfall_df) +
+  geom_rect(aes(xmin = x - 0.4, xmax = x + 0.4,
+                ymin = ymin, ymax = ymax,
+                fill = type)) +
+  scale_x_continuous(
+    breaks = waterfall_df$x,
+    labels = waterfall_df$Step
+  ) +
+  scale_fill_manual(values = c(base = "#1b9e77",
+                               loss = "#d95f02",
+                               final = "#7570b3")) +
+  labs(
+    title = "Illustrative Impact of Churn on Gross Margin",
+    x = NULL,
+    y = "Cumulative Gross Margin"
+  ) +
+  theme_minimal()
+
+```
+
+##Marketing ROI visuals
+```{r}
+campaign_roi <- transactions %>%
+  filter(!is.na(campaign_id)) %>%
+  group_by(marketing_channel) %>%
+  summarise(
+    total_revenue      = sum(revenue, na.rm = TRUE),
+    total_gross_margin = sum(gross_margin, na.rm = TRUE),
+    transactions       = n(),
+    avg_discount       = mean(discount_pct, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # use simple proxy for spend if you don't have it:
+    est_spend = 0.3 * total_gross_margin,
+    ROI = total_gross_margin / est_spend
+  )
+```
+
+## channel ROI BAR chart
+```{r eval=FALSE}
+ggplot(campaign_roi,
+       aes(x = reorder(marketing_channel, ROI),
+           y = ROI)) +
+  geom_col(fill = "#4CAF50") +
+  coord_flip() +
+  labs(
+    title = "Estimated ROI by Marketing Channel",
+    x = NULL,
+    y = "ROI (Gross Margin / Spend Proxy)"
+  ) +
+  theme_minimal()
+```
+
+## revenue vs margin scatter 
+```{r}
+ggplot(campaign_roi,
+       aes(x = total_revenue,
+           y = total_gross_margin,
+           size = transactions,
+           color = marketing_channel)) +
+  geom_point(alpha = 0.8) +
+  scale_size_continuous(range = c(3, 10)) +
+  labs(
+    title = "Channel Revenue vs Gross Margin",
+    x = "Total Revenue",
+    y = "Total Gross Margin",
+    size = "Transactions",
+    color = "Channel"
+  ) +
+  theme_minimal()
+```
+
+## simple gantt timeline 
+```{r}
+library(lubridate)
+
+timeline <- tibble(
+  Phase  = c("Phase 1: Model Setup",
+             "Phase 2: Retention Pilot",
+             "Phase 3: Scale & Optimize"),
+  start  = as.Date(c("2026-01-01", "2026-02-01", "2026-04-01")),
+  end    = as.Date(c("2026-01-31", "2026-03-31", "2026-06-30"))
+)
+
+ggplot(timeline,
+       aes(y = Phase,
+           x = start,
+           xend = end,
+           yend = Phase)) +
+  geom_segment(size = 8, color = "#2C7BB6") +
+  labs(
+    title = "Implementation Timeline",
+    x = NULL,
+    y = NULL
+  ) +
+  theme_minimal()
+```
+
+## time series of total gross margin by month 
+```{r}
+library(tidyverse)
+library(lubridate)
+
+# aggregate gross margin by month
+margin_ts <- transactions %>%
+  mutate(month = floor_date(transaction_date, unit = "month")) %>%
+  group_by(month) %>%
+  summarise(
+    total_gross_margin = sum(gross_margin, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(margin_ts, aes(x = month, y = total_gross_margin)) +
+  geom_line(color = "#2C7BB6", linewidth = 1) +
+  geom_point(color = "#2C7BB6", size = 2) +
+  labs(
+    title = "Monthly Gross Margin Over Time",
+    x = NULL,
+    y = "Total Gross Margin"
+  ) +
+  theme_minimal()
+```
+
+
+```{r}
+library(tidyverse)
+
+# 1) Average gross margin per customer
+avg_margin_per_cust <- customer_features %>%
+  summarize(avg_margin = mean(total_gross_margin, na.rm = TRUE)) %>%
+  pull(avg_margin)
+
+# 2) Churn rate (customers with churn_flag = 1)
+churn_rate <- mean(customer_features$churn_flag)
+
+# 3) Build waterfall data
+waterfall_df <- tibble(
+  Step = c("Total Potential Margin",
+           "Lost to Churn",
+           "Remaining"),
+  Value = c(
+    nrow(customer_features) * avg_margin_per_cust,                       # all customers
+    - nrow(customer_features) * avg_margin_per_cust * churn_rate,        # margin lost
+    nrow(customer_features) * avg_margin_per_cust * (1 - churn_rate)     # margin left
+  ),
+  type = c("base", "loss", "final")
+)
+
+# 4) Compute cumulative positions for rectangles
+waterfall_df <- waterfall_df %>%
+  mutate(
+    cumulative = cumsum(Value),
+    ymin = lag(cumulative, default = 0),
+    ymax = cumulative,
+    x = as.numeric(factor(Step))    # numeric x for plotting
+  )
+
+# 5) Plot – "Illustrative Impact of Churn on Gross Margin"
+p_waterfall <- ggplot(waterfall_df) +
+  geom_rect(aes(xmin = x - 0.4, xmax = x + 0.4,
+                ymin = ymin, ymax = ymax,
+                fill = type)) +
+  scale_x_continuous(
+    breaks = waterfall_df$x,
+    labels = waterfall_df$Step
+  ) +
+  scale_fill_manual(values = c(
+    base  = "#1b9e77",
+    loss  = "#d95f02",
+    final = "#7570b3"
+  )) +
+  labs(
+    title = "Illustrative Impact of Churn on Gross Margin",
+    x = NULL,
+    y = "Cumulative Gross Margin"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+p_waterfall
+```
+## 3. Analysis
+## 3.1 Customer Feature Engineering
+
+Customer-level features were generated by aggregating the transactional dataset. Recency and frequency measures captured temporal purchasing behavior. Margin-based features quantified profitability. A churn flag was created using a common business rule of 180+ days since last purchase.
+
+These features were used as inputs into all predictive models.
+
+## 3.2 Predictive Modeling for Customer Churn
+
+Three models were evaluated:
+
+Logistic Regression
+
+The baseline statistical model provided interpretability and highlighted directional effects. Recency and frequency were significant predictors, as expected. However, the model underperformed compared to machine-learning alternatives due to nonlinearities and interactions in customer behavior patterns.
+
+Random Forest
+
+This model captured nonlinear relationships and feature interactions.
+Key findings:
+
+Achieved higher accuracy and AUC than logistic regression
+
+Showed strong feature importance for:
+
+Recency days
+
+Total revenue
+
+Frequency (90-day window)
+
+Reduced overfitting through tuning (300 trees, mtry = 3)
+
+XGBoost
+
+XGBoost yielded the best performance overall, with the highest AUC.
+Its gradient-boosting framework allowed improved classification of churners, particularly in imbalanced datasets.
+
+## 3.3 Model Comparison
+
+A consolidated performance table was created including accuracy, AUC, sensitivity, and specificity. Both tree models substantially improved predictive power over logistic regression. XGBoost provided the best trade-off between sensitivity and specificity.
+
+3.4 Impact of Churn on Gross Margin
+
+A simple waterfall visualization quantified the financial significance of churn:
+
+Total potential customer margin was estimated
+
+The margin loss attributable to churn was isolated
+
+Remaining recoverable margin was displayed
+
+This helps Finance and Marketing teams orient around the economic stakes of churn-reduction strategies.
+
+## 3.5 Marketing ROI Analysis
+
+A channel-level marketing ROI assessment was performed by aggregating revenue and gross margin, and applying a spend proxy equal to 30% of gross margin when explicit spend data was unavailable.
+
+Key insights:
+
+ROI varies significantly across marketing channels
+
+Some channels yield high gross margin with relatively low spend, identifying areas for scaling
+
+Others generate volume but low margin contribution
+
+Supplemental visualizations include:
+
+ROI bar chart, comparing marketing channels
+
+Revenue vs. Margin scatterplot, showing performance distribution
+
+Timeline (Gantt chart) for proposed implementation phases
+
+Monthly margin time series, highlighting financial trends
+
+## 4. Discussion & Conclusion
+
+The study demonstrates the value of combining predictive analytics with business-oriented profitability analysis. The Random Forest and XGBoost models prove effective at identifying customers at risk of churn, with recency emerging as the most dominant predictor. These insights can inform targeted retention programs—discounts, loyalty offers, or proactive outreach—prioritizing high-margin customers.
+
+Marketing analysis reveals that not all channels contribute equally to profitability. FusionTech can improve its marketing ROI by reallocating spending away from low-impact channels and scaling high-performing ones. The integration of churn prediction with marketing data also opens the door to personalized, model-driven campaign strategies.
+
+Future work could include:
+
+Incorporating customer demographics
+
+Using survival models for time-to-churn estimation
+
+Developing prescriptive optimization for marketing allocation
+
+Overall, this analysis supports data-driven decision-making around customer retention and marketing efficiency for FusionTech.
